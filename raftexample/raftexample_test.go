@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,72 +26,102 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"go.etcd.io/raft/v3/raftpb"
 )
 
-func getSnapshotFn() (func() ([]byte, error), <-chan struct{}) {
-	snapshotTriggeredC := make(chan struct{})
-	return func() ([]byte, error) {
-		snapshotTriggeredC <- struct{}{}
-		return nil, nil
-	}, snapshotTriggeredC
+type peer struct {
+	node        *raftNode
+	proposeC    chan string
+	confChangeC chan raftpb.ConfChange
+	fsm         FSM
+}
+
+type nullFSM struct{}
+
+func (nullFSM) TakeSnapshot() ([]byte, error) {
+	return nil, nil
+}
+
+func (nullFSM) RestoreSnapshot(_ []byte) error {
+	return nil
+}
+
+func (nullFSM) ApplyCommits(_ *commit) error {
+	return nil
 }
 
 type cluster struct {
-	peers              []string
-	commitC            []<-chan *commit
-	errorC             []<-chan error
-	proposeC           []chan string
-	confChangeC        []chan raftpb.ConfChange
-	snapshotTriggeredC []<-chan struct{}
+	peerNames []string
+	peers     []*peer
 }
 
 // newCluster creates a cluster of n nodes
-func newCluster(n int) *cluster {
-	peers := make([]string, n)
-	for i := range peers {
-		peers[i] = fmt.Sprintf("http://127.0.0.1:%d", 10000+i)
+func newCluster(fsms ...FSM) *cluster {
+	clus := cluster{
+		peerNames: make([]string, 0, len(fsms)),
+		peers:     make([]*peer, 0, len(fsms)),
+	}
+	for i := range fsms {
+		clus.peerNames = append(clus.peerNames, fmt.Sprintf("http://127.0.0.1:%d", 10000+i))
 	}
 
-	clus := &cluster{
-		peers:              peers,
-		commitC:            make([]<-chan *commit, len(peers)),
-		errorC:             make([]<-chan error, len(peers)),
-		proposeC:           make([]chan string, len(peers)),
-		confChangeC:        make([]chan raftpb.ConfChange, len(peers)),
-		snapshotTriggeredC: make([]<-chan struct{}, len(peers)),
+	for i, fsm := range fsms {
+		id := uint64(i + 1)
+		peer := peer{
+			proposeC:    make(chan string, 1),
+			confChangeC: make(chan raftpb.ConfChange, 1),
+			fsm:         fsm,
+		}
+
+		snapdir := fmt.Sprintf("raftexample-%d-snap", id)
+		os.RemoveAll(fmt.Sprintf("raftexample-%d", id))
+		os.RemoveAll(snapdir)
+
+		snapshotLogger := zap.NewExample()
+		snapshotStorage, err := newSnapshotStorage(snapshotLogger, snapdir)
+		if err != nil {
+			log.Fatalf("raftexample: %v", err)
+		}
+
+		peer.node = startRaftNode(
+			id, clus.peerNames, false,
+			peer.fsm, snapshotStorage,
+			peer.proposeC, peer.confChangeC,
+		)
+		clus.peers = append(clus.peers, &peer)
 	}
 
+	return &clus
+}
+
+// Cleanup cleans up temporary files used by the test cluster.
+func (clus *cluster) Cleanup() {
 	for i := range clus.peers {
 		os.RemoveAll(fmt.Sprintf("raftexample-%d", i+1))
 		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
-		clus.proposeC[i] = make(chan string, 1)
-		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
-		fn, snapshotTriggeredC := getSnapshotFn()
-		clus.snapshotTriggeredC[i] = snapshotTriggeredC
-		clus.commitC[i], clus.errorC[i], _ = newRaftNode(i+1, clus.peers, false, fn, clus.proposeC[i], clus.confChangeC[i])
 	}
-
-	return clus
 }
 
 // Close closes all cluster nodes and returns an error if any failed.
 func (clus *cluster) Close() (err error) {
-	for i := range clus.peers {
-		go func(i int) {
-			for range clus.commitC[i] {
+	for _, peer := range clus.peers {
+		peer := peer
+		go func() {
+			//nolint:revive
+			for range peer.node.commitC {
 				// drain pending commits
 			}
-		}(i)
-		close(clus.proposeC[i])
+		}()
+		close(peer.proposeC)
 		// wait for channel to close
-		if erri := <-clus.errorC[i]; erri != nil {
+		<-peer.node.Done()
+		if erri := peer.node.Err(); erri != nil {
 			err = erri
 		}
-		// clean intermediates
-		os.RemoveAll(fmt.Sprintf("raftexample-%d", i+1))
-		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
 	}
+	clus.Cleanup()
 	return err
 }
 
@@ -102,47 +133,94 @@ func (clus *cluster) closeNoErrors(t *testing.T) {
 	t.Log("closing cluster [done]")
 }
 
+type feedbackFSM struct {
+	nullFSM
+	peer     *peer
+	id       int
+	reEcho   int
+	expected int
+	received int
+}
+
+func newFeedbackFSM(id int, reEcho int, expected int) *feedbackFSM {
+	return &feedbackFSM{
+		id:       id,
+		reEcho:   reEcho,
+		expected: expected,
+	}
+}
+
+func (fsm *feedbackFSM) ApplyCommits(commit *commit) error {
+	for _, msg := range commit.data {
+		var originator, source, index int
+		if n, err := fmt.Sscanf(msg, "foo%d-%d-%d", &originator, &source, &index); err != nil || n != 3 {
+			panic(err)
+		}
+		if fsm.reEcho > 0 {
+			fsm.peer.proposeC <- fmt.Sprintf("foo%d-%d-%d", originator, fsm.id, index+1)
+			fsm.reEcho--
+		}
+
+		fsm.received++
+		if fsm.received == fsm.expected {
+			close(fsm.peer.proposeC)
+		}
+	}
+
+	close(commit.applyDoneC)
+
+	return nil
+}
+
 // TestProposeOnCommit starts three nodes and feeds commits back into the proposal
 // channel. The intent is to ensure blocking on a proposal won't block raft progress.
 func TestProposeOnCommit(t *testing.T) {
-	clus := newCluster(3)
-	defer clus.closeNoErrors(t)
+	// We generate one proposal for each node to kick things off, then
+	// each node "echos" back the first 99 commits that it receives.
+	// So the total number of commits that each node expects to see is
+	// 300.
+	fsms := []*feedbackFSM{
+		newFeedbackFSM(1, 99, 300),
+		newFeedbackFSM(2, 99, 300),
+		newFeedbackFSM(3, 99, 300),
+	}
+	clus := newCluster(fsms[0], fsms[1], fsms[2])
+	for i := range fsms {
+		fsms[i].peer = clus.peers[i]
+	}
+	defer clus.Cleanup()
 
-	donec := make(chan struct{})
-	for i := range clus.peers {
-		// feedback for "n" committed entries, then update donec
-		go func(pC chan<- string, cC <-chan *commit, eC <-chan error) {
-			for n := 0; n < 100; n++ {
-				c, ok := <-cC
-				if !ok {
-					pC = nil
-				}
-				select {
-				case pC <- c.data[0]:
-					continue
-				case err := <-eC:
-					t.Errorf("eC message (%v)", err)
-				}
+	var wg sync.WaitGroup
+	for _, fsm := range fsms {
+		fsm := fsm
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fsm.peer.node.ProcessCommits(); err != nil {
+				t.Error("ProcessCommits returned error", err)
 			}
-			donec <- struct{}{}
-			for range cC {
-				// acknowledge the commits from other nodes so
-				// raft continues to make progress
-			}
-		}(clus.proposeC[i], clus.commitC[i], clus.errorC[i])
+		}()
 
-		// one message feedback per node
-		go func(i int) { clus.proposeC[i] <- "foo" }(i)
+		// Trigger the whole cascade by sending one message per node:
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fsm.peer.proposeC <- fmt.Sprintf("foo%d-%d-%d", fsm.id, fsm.id, 0)
+		}()
 	}
 
-	for range clus.peers {
-		<-donec
+	wg.Wait()
+
+	for _, fsm := range fsms {
+		if fsm.received != fsm.expected {
+			t.Errorf("node %d received %d commits (expected %d)", fsm.id, fsm.received, fsm.expected)
+		}
 	}
 }
 
 // TestCloseProposerBeforeReplay tests closing the producer before raft starts.
 func TestCloseProposerBeforeReplay(t *testing.T) {
-	clus := newCluster(1)
+	clus := newCluster(nullFSM{})
 	// close before replay so raft never starts
 	defer clus.closeNoErrors(t)
 }
@@ -150,7 +228,7 @@ func TestCloseProposerBeforeReplay(t *testing.T) {
 // TestCloseProposerInflight tests closing the producer while
 // committed messages are being published to the client.
 func TestCloseProposerInflight(t *testing.T) {
-	clus := newCluster(1)
+	clus := newCluster(nullFSM{})
 	defer clus.closeNoErrors(t)
 
 	var wg sync.WaitGroup
@@ -159,12 +237,12 @@ func TestCloseProposerInflight(t *testing.T) {
 	// some inflight ops
 	go func() {
 		defer wg.Done()
-		clus.proposeC[0] <- "foo"
-		clus.proposeC[0] <- "bar"
+		clus.peers[0].proposeC <- "foo"
+		clus.peers[0].proposeC <- "bar"
 	}()
 
 	// wait for one message
-	if c, ok := <-clus.commitC[0]; !ok || c.data[0] != "foo" {
+	if c, ok := <-clus.peers[0].node.commitC; !ok || c.data[0] != "foo" {
 		t.Fatalf("Commit failed")
 	}
 
@@ -180,11 +258,27 @@ func TestPutAndGetKeyValue(t *testing.T) {
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
-	var kvs *kvstore
-	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(1, clusters, false, getSnapshot, proposeC, confChangeC)
+	id := uint64(1)
+	snapshotLogger := zap.NewExample()
+	snapdir := fmt.Sprintf("raftexample-%d-snap", id)
+	snapshotStorage, err := newSnapshotStorage(snapshotLogger, snapdir)
+	if err != nil {
+		log.Fatalf("raftexample: %v", err)
+	}
 
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	kvs, fsm := newKVStore(proposeC)
+
+	node := startRaftNode(
+		id, clusters, false,
+		fsm, snapshotStorage,
+		proposeC, confChangeC,
+	)
+
+	go func() {
+		if err := node.ProcessCommits(); err != nil {
+			log.Fatalf("raftexample: %v", err)
+		}
+	}()
 
 	srv := httptest.NewServer(&httpKVAPI{
 		store:       kvs,
@@ -231,20 +325,22 @@ func TestPutAndGetKeyValue(t *testing.T) {
 
 // TestAddNewNode tests adding new node to the existing cluster.
 func TestAddNewNode(t *testing.T) {
-	clus := newCluster(3)
+	clus := newCluster(nullFSM{}, nullFSM{}, nullFSM{})
 	defer clus.closeNoErrors(t)
 
+	id := uint64(4)
+	snapdir := fmt.Sprintf("raftexample-%d-snap", id)
 	os.RemoveAll("raftexample-4")
-	os.RemoveAll("raftexample-4-snap")
+	os.RemoveAll(snapdir)
 	defer func() {
 		os.RemoveAll("raftexample-4")
-		os.RemoveAll("raftexample-4-snap")
+		os.RemoveAll(snapdir)
 	}()
 
 	newNodeURL := "http://127.0.0.1:10004"
-	clus.confChangeC[0] <- raftpb.ConfChange{
+	clus.peers[0].confChangeC <- raftpb.ConfChange{
 		Type:    raftpb.ConfChangeAddNode,
-		NodeID:  4,
+		NodeID:  id,
 		Context: []byte(newNodeURL),
 	}
 
@@ -254,15 +350,35 @@ func TestAddNewNode(t *testing.T) {
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
-	newRaftNode(4, append(clus.peers, newNodeURL), true, nil, proposeC, confChangeC)
+	snapshotLogger := zap.NewExample()
+	snapshotStorage, err := newSnapshotStorage(snapshotLogger, snapdir)
+	if err != nil {
+		log.Fatalf("raftexample: %v", err)
+	}
+
+	startRaftNode(
+		id, append(clus.peerNames, newNodeURL), true,
+		nullFSM{}, snapshotStorage,
+		proposeC, confChangeC,
+	)
 
 	go func() {
 		proposeC <- "foo"
 	}()
 
-	if c, ok := <-clus.commitC[0]; !ok || c.data[0] != "foo" {
+	if c, ok := <-clus.peers[0].node.commitC; !ok || c.data[0] != "foo" {
 		t.Fatalf("Commit failed")
 	}
+}
+
+type snapshotWatcher struct {
+	nullFSM
+	C chan struct{}
+}
+
+func (sw snapshotWatcher) TakeSnapshot() ([]byte, error) {
+	sw.C <- struct{}{}
+	return nil, nil
 }
 
 func TestSnapshot(t *testing.T) {
@@ -275,20 +391,22 @@ func TestSnapshot(t *testing.T) {
 		snapshotCatchUpEntriesN = prevSnapshotCatchUpEntriesN
 	}()
 
-	clus := newCluster(3)
+	sw := snapshotWatcher{C: make(chan struct{})}
+
+	clus := newCluster(sw, nullFSM{}, nullFSM{})
 	defer clus.closeNoErrors(t)
 
 	go func() {
-		clus.proposeC[0] <- "foo"
+		clus.peers[0].proposeC <- "foo"
 	}()
 
-	c := <-clus.commitC[0]
+	c := <-clus.peers[0].node.commitC
 
 	select {
-	case <-clus.snapshotTriggeredC[0]:
+	case <-sw.C:
 		t.Fatalf("snapshot triggered before applying done")
 	default:
 	}
 	close(c.applyDoneC)
-	<-clus.snapshotTriggeredC[0]
+	<-sw.C
 }

@@ -18,20 +18,17 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
-
-	"go.etcd.io/raft/v3/raftexample/snap"
-	"go.etcd.io/raft/v3/raftpb"
 )
 
 // a key-value store backed by raft
 type kvstore struct {
-	proposeC    chan<- string // channel for proposing updates
-	mu          sync.RWMutex
-	kvStore     map[string]string // current committed key-value pairs
-	snapshotter *snap.Snapshotter
+	proposeC chan<- string // channel for proposing updates
+	mu       sync.RWMutex
+	kvStore  map[string]string // current committed key-value pairs
 }
 
 type kv struct {
@@ -39,21 +36,18 @@ type kv struct {
 	Val string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
-	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
-	snapshot, err := s.loadSnapshot()
-	if err != nil {
-		log.Panic(err)
+// newKVStore creates and returns a new `kvstore`. The second return
+// value can be used as the finite state machine that is driven by a
+// `raftNode`.
+func newKVStore(proposeC chan<- string) (*kvstore, kvfsm) {
+	s := &kvstore{
+		proposeC: proposeC,
+		kvStore:  make(map[string]string),
 	}
-	if snapshot != nil {
-		log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
-		if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
-			log.Panic(err)
-		}
+	fsm := kvfsm{
+		kvs: s,
 	}
-	// read commits from raft into kvStore map until error
-	go s.readCommits(commitC, errorC)
-	return s
+	return s, fsm
 }
 
 func (s *kvstore) Lookup(key string) (string, bool) {
@@ -71,64 +65,53 @@ func (s *kvstore) Propose(k string, v string) {
 	s.proposeC <- buf.String()
 }
 
-func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
-	for commit := range commitC {
-		if commit == nil {
-			// signaled to load snapshot
-			snapshot, err := s.loadSnapshot()
-			if err != nil {
-				log.Panic(err)
-			}
-			if snapshot != nil {
-				log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
-				if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
-					log.Panic(err)
-				}
-			}
-			continue
-		}
-
-		for _, data := range commit.data {
-			var dataKv kv
-			dec := gob.NewDecoder(bytes.NewBufferString(data))
-			if err := dec.Decode(&dataKv); err != nil {
-				log.Fatalf("raftexample: could not decode message (%v)", err)
-			}
-			s.mu.Lock()
-			s.kvStore[dataKv.Key] = dataKv.Val
-			s.mu.Unlock()
-		}
-		close(commit.applyDoneC)
-	}
-	if err, ok := <-errorC; ok {
-		log.Fatal(err)
-	}
+// Set sets a single value. It should only be called by `kvfsm`.
+func (s *kvstore) set(k, v string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kvStore[k] = v
 }
 
-func (s *kvstore) getSnapshot() ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return json.Marshal(s.kvStore)
+func (s *kvstore) restoreFromSnapshot(store map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kvStore = store
 }
 
-func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
-	snapshot, err := s.snapshotter.Load()
-	if err == snap.ErrNoSnapshot {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return snapshot, nil
+// kvfsm implements the `FSM` interface for the underlying `*kvstore`.
+type kvfsm struct {
+	kvs *kvstore
 }
 
-func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
+// RestoreSnapshot restores the current state of the KV store to the
+// value encoded in `snapshot`.
+func (fsm kvfsm) RestoreSnapshot(snapshot []byte) error {
 	var store map[string]string
 	if err := json.Unmarshal(snapshot, &store); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.kvStore = store
+	fsm.kvs.restoreFromSnapshot(store)
+	return nil
+}
+
+func (fsm kvfsm) TakeSnapshot() ([]byte, error) {
+	fsm.kvs.mu.RLock()
+	defer fsm.kvs.mu.RUnlock()
+	return json.Marshal(fsm.kvs.kvStore)
+}
+
+// ApplyCommits decodes and applies each of the commits in `commit` to
+// the current state, then signals that it is done by closing
+// `commit.applyDoneC`.
+func (fsm kvfsm) ApplyCommits(commit *commit) error {
+	for _, data := range commit.data {
+		var dataKv kv
+		dec := gob.NewDecoder(bytes.NewBufferString(data))
+		if err := dec.Decode(&dataKv); err != nil {
+			return fmt.Errorf("could not decode message: %w", err)
+		}
+		fsm.kvs.set(dataKv.Key, dataKv.Val)
+	}
+	close(commit.applyDoneC)
 	return nil
 }

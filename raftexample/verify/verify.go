@@ -20,12 +20,15 @@ import (
 	"strings"
 )
 
+//nolint:revive
 const ENV_VERIFY = "ETCD_VERIFY"
 
 type VerificationType string
 
 const (
-	ENV_VERIFY_VALUE_ALL    VerificationType = "all"
+	//nolint:revive
+	ENV_VERIFY_VALUE_ALL VerificationType = "all"
+	//nolint:revive
 	ENV_VERIFY_VALUE_ASSERT VerificationType = "assert"
 )
 

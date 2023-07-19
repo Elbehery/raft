@@ -16,14 +16,18 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"log"
 	"strings"
+
+	"go.uber.org/zap"
 
 	"go.etcd.io/raft/v3/raftpb"
 )
 
 func main() {
 	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
-	id := flag.Int("id", 1, "node ID")
+	id := flag.Uint64("id", 1, "node ID")
 	kvport := flag.Int("port", 9121, "key-value server port")
 	join := flag.Bool("join", false, "join an existing cluster")
 	flag.Parse()
@@ -34,12 +38,28 @@ func main() {
 	defer close(confChangeC)
 
 	// raft provides a commit stream for the proposals from the http api
-	var kvs *kvstore
-	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
 
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	snapshotLogger := zap.NewExample()
+	snapdir := fmt.Sprintf("raftexample-%d-snap", *id)
+	snapshotStorage, err := newSnapshotStorage(snapshotLogger, snapdir)
+	if err != nil {
+		log.Fatalf("raftexample: %v", err)
+	}
+
+	kvs, fsm := newKVStore(proposeC)
+
+	rc := startRaftNode(
+		*id, strings.Split(*cluster, ","), *join,
+		fsm, snapshotStorage,
+		proposeC, confChangeC,
+	)
+
+	go func() {
+		if err := rc.ProcessCommits(); err != nil {
+			log.Fatalf("raftexample: %v", err)
+		}
+	}()
 
 	// the key-value http handler will propose updates to raft
-	serveHTTPKVAPI(kvs, *kvport, confChangeC, errorC)
+	serveHTTPKVAPI(kvs, *kvport, confChangeC, rc.Done())
 }

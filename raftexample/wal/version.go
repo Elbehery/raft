@@ -32,6 +32,8 @@ import (
 
 // ReadWALVersion reads remaining entries from opened WAL and returns struct
 // that implements schema.WAL interface.
+//
+//nolint:revive
 func ReadWALVersion(w *WAL) (*walVersion, error) {
 	_, _, ents, err := w.ReadAll()
 	if err != nil {

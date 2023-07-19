@@ -78,6 +78,7 @@ type txnRequestStringer struct {
 	Request *TxnRequest
 }
 
+//nolint:revive
 func NewLoggableTxnRequest(request *TxnRequest) *txnRequestStringer {
 	return &txnRequestStringer{request}
 }
@@ -167,6 +168,7 @@ type loggablePutRequest struct {
 	IgnoreLease bool   `protobuf:"varint,6,opt,name=ignore_lease,proto3"`
 }
 
+//nolint:revive
 func NewLoggablePutRequest(request *PutRequest) *loggablePutRequest {
 	return &loggablePutRequest{
 		request.Key,
